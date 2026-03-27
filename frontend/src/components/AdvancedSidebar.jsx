@@ -1,6 +1,7 @@
 import { useMemo, useState, useEffect } from "react";
 import { motion } from "motion/react"
-
+import Calendar from 'react-calendar';
+import 'react-calendar/dist/Calendar.css';
 
 function CollapsibleSection({ title, defaultOpen = true, children, right }) {
   const [open, setOpen] = useState(defaultOpen);
@@ -28,13 +29,13 @@ function CollapsibleSection({ title, defaultOpen = true, children, right }) {
 export default function AdvancedSidebar({
   advOpen,
   setAdvOpen,
-  //yearFrom,
-  //setYearFrom,
-  //yearTo,
-  //setYearTo,
+  yearFrom,
+  setYearFrom,
+  yearTo,
+  setYearTo,
   agencySearch,
   setAgencySearch,
-  agenciesToShow,
+  // agenciesToShow is now fetched internally — removed from props
   selectedAgencies,
   setSelectedAgencies,
   docType,
@@ -48,10 +49,41 @@ export default function AdvancedSidebar({
   activeCount,
 }) {
   const docTypes = ["Rulemaking", "Nonrulemaking"];
+  const [value, setOnchange] = useState([new Date(), new Date()]);
   //const statuses = ["Open", "Closed", "Pending"];
   const [agencyOrder, setAgencyOrder] = useState([]);
   const [selectedTitle, setSelectedTitle] = useState("");
+
+  // FIX: agenciesToShow is now local state, fetched from /agencies endpoint
+  const [agenciesToShow, setAgenciesToShow] = useState([]);
+  const [agenciesLoading, setAgenciesLoading] = useState(false);
+  const [agenciesError, setAgenciesError] = useState(null);
+
   const titles = Array.from({ length: 50 }, (_, i) => i + 1);
+
+  // Fetch agencies from the /agencies endpoint
+  useEffect(() => {
+    setAgenciesLoading(true);
+    setAgenciesError(null);
+
+    fetch("/agencies")
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((ids) => {
+        // Endpoint returns plain strings like ["EPA", "DOT", ...]
+        // Sidebar expects { code, name } shape
+        setAgenciesToShow(ids.map((id) => ({ code: id, name: id })));
+        console.log("agencies from API:", ids);
+        console.log("total agencies:", ids.length);
+      })
+      .catch((err) => {
+        console.error("Failed to load agencies:", err);
+        setAgenciesError("Could not load agencies.");
+      })
+      .finally(() => setAgenciesLoading(false));
+  }, []);
 
   const selectedCfrList = useMemo(() => {
     return Object.entries(selectedCfrParts).flatMap(([title, parts]) =>
@@ -124,19 +156,22 @@ export default function AdvancedSidebar({
     );
   }
 
-  const cfrParts = selectedTitle
-  ? generatePartsForTitle(selectedTitle)
-  : [];
-
   // Because different titles have differing amount of CFR Parts, the following structure
   // Uses information from ecfr.gov to build the appropriate amount of parts per title
+
+  // FIX: useMemo prevents new array reference on every render (was causing infinite loop)
+  const cfrParts = useMemo(
+    () => (selectedTitle ? generatePartsForTitle(selectedTitle) : []),
+    [selectedTitle]
+  );
 
   const [cfrSearch, setCfrSearch] = useState("");
   const [cfrOrder, setCfrOrder] = useState([]);
 
+  // FIX: depend on selectedTitle not the array itself (array ref changed every render)
   useEffect(() => {
     setCfrOrder(cfrParts);
-  }, [cfrParts]);
+  }, [selectedTitle]);
 
   const orderedAgencies = useMemo(() => {
     const order =
@@ -148,10 +183,16 @@ export default function AdvancedSidebar({
   }, [agenciesToShow, agencyOrder]);
 
   const visibleAgencies = useMemo(() => {
-    if (agencySearch.trim()) {
-      return orderedAgencies;
+    const q = agencySearch.trim().toLowerCase();
+  
+    // If user typed something, filter by their query
+    if (q) {
+      return orderedAgencies.filter(
+        a => a.code.toLowerCase().includes(q) || a.name.toLowerCase().includes(q)
+      );
     }
-
+  
+    // If nothing is in the search bar, show atleast 5 agencies
     const minVisible = Math.max(5, selectedAgencies.size);
     return orderedAgencies.slice(0, minVisible);
   }, [agencySearch, orderedAgencies, selectedAgencies.size]);
@@ -171,6 +212,14 @@ export default function AdvancedSidebar({
       const base = prev.length > 0 ? prev : agenciesToShow.map((a) => a.code);
       return [code, ...base.filter((item) => item !== code)];
     });
+  };
+
+  const normalizeDate = (val, isEnd = false) => {
+    const yearOnly = /^\d{4}$/.test(val.trim());
+    if (yearOnly) {
+      return isEnd ? `${val.trim()}-12-31` : `${val.trim()}-01-01`;
+    }
+    return val;
   };
 
   const filteredCfrParts = useMemo(() => {
@@ -245,7 +294,9 @@ export default function AdvancedSidebar({
 
       {advOpen && (
         <div className="advBody">
-          {/* Date 
+
+          {/**Date Section */}
+
           <section className="section">
             <h3>Date Range</h3>
 
@@ -254,49 +305,121 @@ export default function AdvancedSidebar({
                 type="button"
                 className="chip"
                 onClick={() => {
-                  setYearFrom("2021");
-                  setYearTo("2023");
-                }}
-              >
-                2021–2023
-              </button>
-
-              <button
-                type="button"
-                className="chip"
-                onClick={() => {
-                  setYearFrom("2024");
-                  setYearTo("2024");
-                }}
-              >
-                2024
-              </button>
-
-              <button
-                type="button"
-                className="chip"
-                onClick={() => {
                   setYearFrom("");
                   setYearTo("");
+                  setOnchange([null, null]);
                 }}
               >
                 All time
               </button>
+              <button
+            type="button"
+            className="chip"
+            onClick={() => {
+              const end = new Date();
+              const start = new Date();
+              start.setFullYear(start.getFullYear() - 1);
+
+              const format = (d) => d.toLocaleDateString("en-CA");
+              setYearFrom(format(start));
+              setYearTo(format(end));
+              setOnchange([start, end]);
+            }}
+          >
+            Past Year
+          </button>
+
+          <button
+            type="button"
+            className="chip"
+            onClick={() => {
+              const end = new Date();
+              const start = new Date();
+              start.setMonth(start.getMonth() - 6);
+
+              const format = (d) => d.toLocaleDateString("en-CA");
+              setYearFrom(format(start));
+              setYearTo(format(end));
+              setOnchange([start, end]);
+            }}
+          >
+            Past 6 Months
+          </button>
+
             </div>
 
             <div className="row">
-              <input
-                value={yearFrom}
-                onChange={(e) => setYearFrom(e.target.value)}
-                placeholder="From"
-              />
-              <input
-                value={yearTo}
-                onChange={(e) => setYearTo(e.target.value)}
-                placeholder="To"
+            <input
+            value={yearFrom}
+            onChange={(e) => {
+              const raw = e.target.value;
+              setYearFrom(raw);
+
+              // Only normalize + sync calendar once it looks complete
+              const normalized = normalizeDate(raw, false);
+              const isYearOnly = /^\d{4}$/.test(raw.trim());
+
+              if (isYearOnly) {
+                const endNorm = `${raw.trim()}-12-31`;
+                setYearTo(endNorm);                          // auto-fill To
+                setOnchange([new Date(normalized), new Date(endNorm)]);
+              } else if (normalized && yearTo) {
+                setOnchange([new Date(normalized), new Date(yearTo)]);
+              }
+            }}
+            placeholder="YYYY or YYYY-MM-DD"
+          />
+
+          <input
+            value={yearTo}
+            onChange={(e) => {
+              const raw = e.target.value;
+              setYearTo(raw);
+
+              const normalized = normalizeDate(raw, true);
+              const isYearOnly = /^\d{4}$/.test(raw.trim());
+
+              if (isYearOnly) {
+                const startNorm = yearFrom || `${raw.trim()}-01-01`;
+                setOnchange([new Date(startNorm), new Date(normalized)]);
+              } else if (yearFrom && normalized) {
+                setOnchange([new Date(yearFrom), new Date(normalized)]);
+              }
+            }}
+            placeholder="YYYY or YYYY-MM-DD"
+          />
+            </div>
+
+            <div className="calendar-div">
+              <Calendar
+                selectRange={true}
+                onChange={(range) => {
+                  if (!Array.isArray(range)) return;
+
+                  let [start, end] = range;
+
+                  // Handle first click (no end yet)
+                  if (!end) {
+                    setOnchange([start, null]);
+                    setYearFrom(start.toISOString().split("T")[0]);
+                    return;
+                  }
+
+                  // Auto-swap if user selects backwards
+                  if (start > end) {
+                    [start, end] = [end, start];
+                  }
+
+                  const format = (d) => d.toLocaleDateString("en-CA");
+
+                  setOnchange([start, end]);
+                  setYearFrom(format(start));
+                  setYearTo(format(end));
+                }}
+                value={value}
               />
             </div>
-          </section> */}
+          </section>
 
           {/* Agency */}
           <CollapsibleSection title="Agency">
@@ -306,22 +429,34 @@ export default function AdvancedSidebar({
               placeholder="Search agencies…"
             />
 
-            <div className="agencyListStatic">
-              {visibleAgencies.map((a) => (
-                <label key={a.code} className="check">
-                  <input
-                    type="checkbox"
-                    checked={selectedAgencies.has(a.code)}
-                    onChange={() => toggleAgency(a.code)}
-                  />
-                  <span>
-                    {a.code} — {a.name}
-                  </span>
-                </label>
-              ))}
-            </div>
+            {agenciesLoading && (
+              <div className="hintText">Loading agencies…</div>
+            )}
 
-            {!agencySearch.trim() && selectedAgencies.size <= 5 && (
+            {agenciesError && (
+              <div className="hintText" style={{ color: "red" }}>
+                {agenciesError}
+              </div>
+            )}
+
+            {!agenciesLoading && !agenciesError && (
+              <div className="agencyListStatic">
+                {visibleAgencies.map((a) => (
+                  <label key={a.code} className="check">
+                    <input
+                      type="checkbox"
+                      checked={selectedAgencies.has(a.code)}
+                      onChange={() => toggleAgency(a.code)}
+                    />
+                    <span>
+                      {a.code} — {a.name}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            )}
+
+            {!agencySearch.trim() && selectedAgencies.size <= 5 && !agenciesLoading && (
               <div className="hintText">
                 Showing top 5 agencies. Selecting an agency moves it to the top.
               </div>
@@ -381,7 +516,6 @@ export default function AdvancedSidebar({
           </CollapsibleSection>
           )}
 
-
           {/* Doc type */}
           <section className="section">
             <h3>Docket Type</h3>
@@ -396,7 +530,6 @@ export default function AdvancedSidebar({
               </label>
             ))}
           </section>
-
 
           <div className="actions">
             <button className="btn btn-ghost" onClick={clearAdvanced}>

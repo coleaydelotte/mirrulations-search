@@ -7,7 +7,7 @@ factory functions. Dummy-data behavior tests live in test_mock.py.
 # pylint: disable=redefined-outer-name,protected-access
 import pytest
 import mirrsearch.db as db_module
-from mirrsearch.db import DBLayer, get_db
+from mirrsearch.db import DBLayer, cfr_part_filter_patterns, get_db
 
 
 # --- DBLayer instantiation ---
@@ -32,6 +32,74 @@ def test_db_layer_no_conn_returns_empty():
     assert db.search("anything") == []
 
 
+def test_get_agencies_no_conn_returns_empty():
+    assert DBLayer().get_agencies() == []
+
+
+def test_cfr_part_filter_patterns_skips_none_and_blank_parts():
+    assert cfr_part_filter_patterns([None, {"part": "  "}, "413"]) == ["413"]
+
+
+def test_merge_unique_comment_matches_unions_distinct_comment_ids():
+    comments = {
+        "aggregations": {
+            "by_docket": {
+                "buckets": [
+                    {
+                        "key": "D1",
+                        "matching_comments": {
+                            "by_comment": {"buckets": [{"key": "c1"}]}
+                        },
+                    }
+                ]
+            }
+        }
+    }
+    extracted = {
+        "aggregations": {
+            "by_docket": {
+                "buckets": [
+                    {
+                        "key": "D1",
+                        "matching_extracted": {
+                            "by_comment": {"buckets": [{"key": "c2"}]}
+                        },
+                    }
+                ]
+            }
+        }
+    }
+    assert DBLayer._merge_unique_comment_matches(comments, extracted) == {"D1": 2}
+
+
+def test_search_with_cfr_dict_applies_exact_docket_filter(monkeypatch):
+    """Dict-style CFR filter keeps only dockets returned by exact title+part map."""
+    rows = [
+        ("DOC-001", "First", "CMS", "Rulemaking", "2024-01-01", "Title 42", "413", "http://a"),
+        ("DOC-002", "Second", "EPA", "Rulemaking", "2024-01-01", "Title 40", "40", "http://b"),
+    ]
+    db = DBLayer(conn=_FakeConn(rows))
+    monkeypatch.setattr(DBLayer, "_get_cfr_docket_ids", lambda self, _pairs: {"DOC-002"})
+
+    results = db.search(
+        "docket",
+        cfr_part_param=[{"title": "42 CFR Parts 413 and 512", "part": "413"}],
+    )
+
+    assert [r["docket_id"] for r in results] == ["DOC-002"]
+
+
+def test_search_with_plain_cfr_string_skips_exact_cfr_lookup(monkeypatch):
+    """String-style CFR filters should not invoke exact title+part lookup."""
+    db = DBLayer(conn=_FakeConn([]))
+
+    def should_not_call(self, _pairs):
+        raise AssertionError("_get_cfr_docket_ids should not run for plain string filters")
+
+    monkeypatch.setattr(DBLayer, "_get_cfr_docket_ids", should_not_call)
+    db.search("x", cfr_part_param=["413"])
+
+
 def test_get_db_returns_dblayer():
     """Test the get_db factory function returns a DBLayer"""
     db = get_db()
@@ -51,7 +119,7 @@ class _FakeCursor:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def execute(self, sql, params):
+    def execute(self, sql, params=None):
         self.executed = (sql, params)
 
     def fetchall(self):
@@ -70,6 +138,11 @@ class _FakeConn:
 
     def close(self):
         return None
+
+
+def test_get_agencies_with_conn():
+    db = DBLayer(conn=_FakeConn([("CMS",), ("EPA",)]))
+    assert db.get_agencies() == ["CMS", "EPA"]
 
 
 # --- _search_dockets_postgres filter tests ---
@@ -123,7 +196,7 @@ def test_search_dockets_postgres_no_filter_no_extra_clauses():
 
 
 def test_search_dockets_postgres_cfr_filter_from_api_dict():
-    """cfr_part as list of {title, part} dicts (from Flask) becomes ILIKE on cfrPart."""
+    """Dict CFR filter applies cfrPart ILIKE and exact FRD title+part EXISTS."""
     db = DBLayer(conn=_FakeConn([]))
     db._search_dockets_postgres(
         "renal",
@@ -131,7 +204,10 @@ def test_search_dockets_postgres_cfr_filter_from_api_dict():
     )
     sql, params = db.conn.cursor_obj.executed
     assert "cp.cfrPart ILIKE %s" in sql
-    assert params == ["%renal%", "%413%"]
+    assert "JOIN cfrparts cp2 ON cp2.document_id = d2.document_id" in sql
+    assert "cp2.title = %s" in sql
+    assert "cp2.cfrPart = %s" in sql
+    assert params == ["%renal%", "%413%", "42 CFR Parts 413 and 512", "413"]
 
 
 def test_search_dockets_postgres_cfr_empty_dict_skips_cfr_clause():
@@ -579,14 +655,14 @@ def test_text_match_terms_searches_comments_and_extracted():
     assert fake_client.searches[1][0] == "comments"
     assert fake_client.searches[2][0] == "comments_extracted_text"
 
-    # Should combine comment sources: 6 comments (2 + 4)
     assert len(results) == 1
     assert results[0]["docket_id"] == "CMS-2025-0240"
-    assert results[0]["comment_match_count"] == 6
+    assert results[0]["comment_match_count"] == 2
+    assert results[0]["document_match_count"] == 4
 
 
 def test_text_match_terms_combines_comment_sources():
-    """Test that comments and extracted text are both counted as comments"""
+    """Comment body counts toward comNum; extracted counts toward docNum."""
     doc_buckets = []
     comment_buckets = [
         _fake_os_comment_agg_bucket("DEA-2024-0059", "matching_comments", "DEA-2024-0059-c1")
@@ -602,11 +678,12 @@ def test_text_match_terms_combines_comment_sources():
 
     assert len(results) == 1
     assert results[0]["docket_id"] == "DEA-2024-0059"
-    assert results[0]["comment_match_count"] == 2  # 1 comment + 1 extracted
+    assert results[0]["comment_match_count"] == 1
+    assert results[0]["document_match_count"] == 1
 
 
 def test_text_match_terms_same_comment_id_body_and_extracted_counts_once():
-    """One logical comment matching in both commentText and extractedText counts once."""
+    """Same commentId in commentText and extractedText: com 1, doc 1 (distinct ids per index)."""
     doc_buckets = []
     comment_buckets = [
         _fake_os_comment_agg_bucket("D1", "matching_comments", "SHARED-COMMENT-ID"),
@@ -620,6 +697,7 @@ def test_text_match_terms_same_comment_id_body_and_extracted_counts_once():
     assert len(results) == 1
     assert results[0]["docket_id"] == "D1"
     assert results[0]["comment_match_count"] == 1
+    assert results[0]["document_match_count"] == 1
 
 
 def test_text_match_terms_multiple_dockets_comments():
@@ -649,10 +727,12 @@ def test_text_match_terms_multiple_dockets_comments():
     assert len(results) == 2
 
     cms = next(r for r in results if r["docket_id"] == "CMS-2025-0240")
-    assert cms["comment_match_count"] == 6  # 2 + 4
+    assert cms["comment_match_count"] == 2
+    assert cms["document_match_count"] == 4
 
     dea = next(r for r in results if r["docket_id"] == "DEA-2024-0059")
     assert dea["comment_match_count"] == 1
+    assert dea["document_match_count"] == 0
 
 
 def test_text_match_terms_uses_filtered_aggregations():
@@ -793,7 +873,7 @@ def test_get_docket_document_comment_totals_with_fake_opensearch():
                         "by_docket": {"buckets": [{"key": "D1", "doc_count": 3}]}
                     }
                 }
-            if "comments" in index:
+            if index == "comments":
                 return {
                     "aggregations": {
                         "by_docket": {
@@ -824,7 +904,7 @@ def test_get_docket_document_comment_totals_with_fake_opensearch():
     assert totals["D1"]["comment_total_count"] == 5
 
 def test_text_match_terms_docket_only_in_extracted():
-    """Multiple extracted chunks for the same commentId count as one comment match."""
+    """Multiple extracted chunks for the same commentId count once on document side."""
     doc_buckets = []
     comment_buckets = []
     extracted_buckets = [
@@ -844,7 +924,8 @@ def test_text_match_terms_docket_only_in_extracted():
 
     assert len(results) == 1
     assert results[0]["docket_id"] == "EXTRACTED-ONLY"
-    assert results[0]["comment_match_count"] == 1
+    assert results[0]["document_match_count"] == 1
+    assert results[0]["comment_match_count"] == 0
 
 
 def test_text_match_terms_missing_extracted_index_still_returns_other_hits():

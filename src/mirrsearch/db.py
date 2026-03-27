@@ -61,6 +61,26 @@ def cfr_part_filter_patterns(cfr_part_param) -> List[str]:
     return [p for p in (_cfr_part_item_pattern(i) for i in cfr_part_param) if p]
 
 
+def _cfr_exact_title_part_pairs(cfr_part_param) -> List[tuple[str, str]]:
+    """
+    Extract exact CFR (title, part) pairs from dict-style filter payloads.
+
+    Used as a second-pass filter to preserve older behavior when clients send
+    ``[{\"title\": \"...\", \"part\": \"...\"}]``.
+    """
+    if not cfr_part_param:
+        return []
+    pairs: List[tuple[str, str]] = []
+    for item in cfr_part_param:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        part = str(item.get("part") or "").strip()
+        if title and part:
+            pairs.append((title, part))
+    return pairs
+
+
 def _parse_positive_int_env(var_name: str, default: int) -> int:
     """Like port parsing but only enforces value >= 1 (empty/invalid → default)."""
     raw = (os.getenv(var_name) or "").strip()
@@ -99,21 +119,56 @@ def _opensearch_comment_id_terms_size() -> int:
 class DBLayer:
     conn: Any = None
 
-    def search(
+    def search(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
             self,
             query: str,
             docket_type_param: str = None,
             agency: List[str] = None,
-            cfr_part_param: List[str] = None) \
+            cfr_part_param: List[str] = None,
+            start_date: str = None,
+            end_date: str = None) \
             -> List[Dict[str, Any]]:
         if self.conn is None:
             return []
-        return self._search_dockets_postgres(query, docket_type_param, agency, cfr_part_param)
+        results = self._search_dockets_postgres(
+            query, docket_type_param, agency, cfr_part_param, start_date, end_date
+        )
+        exact_pairs = _cfr_exact_title_part_pairs(cfr_part_param)
+        if not exact_pairs:
+            return results
+        allowed = self._get_cfr_docket_ids(exact_pairs)
+        return [row for row in results if row["docket_id"] in allowed]
 
-    def _search_dockets_postgres(  # pylint: disable=too-many-locals
+    def _get_cfr_docket_ids(self, cfr_pairs: List[tuple[str, str]]) -> Set[str]:
+        """
+        Return docket IDs matching exact CFR title+part pairs.
+
+        This keeps the stricter CFR behavior from older search flow while still
+        using the current SQL/cfrPart substring filtering for compatibility.
+        """
+        if self.conn is None or not cfr_pairs:
+            return set()
+        clauses = " OR ".join("(cp.title = %s AND cp.cfrPart = %s)" for _ in cfr_pairs)
+        sql = f"""
+            SELECT DISTINCT d.docket_id
+            FROM documents d
+            JOIN cfrparts cp ON cp.document_id = d.document_id
+            WHERE ({clauses})
+        """
+        params: List[str] = []
+        for title, part in cfr_pairs:
+            params.append(title)
+            params.append(part)
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params)
+            return {row[0] for row in cur.fetchall()}
+
+    def _search_dockets_postgres(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-statements
             self, query: str, docket_type_param: str = None,
             agency: List[str] = None,
-            cfr_part_param: List[str] = None) -> List[Dict[str, Any]]:
+            cfr_part_param: List[str] = None,
+            start_date: str = None,
+            end_date: str = None) -> List[Dict[str, Any]]:
         sql = """
             SELECT DISTINCT
                 d.docket_id,
@@ -140,12 +195,36 @@ class DBLayer:
             clauses = " OR ".join("d.agency_id ILIKE %s" for _ in agency)
             sql += f" AND ({clauses})"
             params.extend(f"%{a}%" for a in agency)
+        if start_date:
+            sql += " AND d.modify_date::date >= %s::date"
+            params.append(start_date)
+        if end_date:
+            sql += " AND d.modify_date::date <= %s::date"
+            params.append(end_date)
 
         cfr_patterns = cfr_part_filter_patterns(cfr_part_param)
         if cfr_patterns:
             clauses = " OR ".join("cp.cfrPart ILIKE %s" for _ in cfr_patterns)
             sql += f" AND ({clauses})"
             params.extend(f"%{p}%" for p in cfr_patterns)
+        # For dict-style filters ({title, part}), also constrain dockets by exact
+        # CFR title/part mapping in cfrparts (via documents->docket_id) in this first query.
+        exact_pairs = _cfr_exact_title_part_pairs(cfr_part_param)
+        if exact_pairs:
+            exact_clauses = " OR ".join(
+                "(cp2.title = %s AND cp2.cfrPart = %s)"
+                for _ in exact_pairs
+            )
+            sql += (
+                " AND EXISTS ("
+                "SELECT 1 FROM documents d2 "
+                "JOIN cfrparts cp2 ON cp2.document_id = d2.document_id "
+                "WHERE d2.docket_id = d.docket_id "
+                f"AND ({exact_clauses})"
+                ")"
+            )
+            for title, part in exact_pairs:
+                params.extend([title, part])
 
         sql += " ORDER BY d.modify_date DESC, d.docket_id, cp.title, cp.cfrPart LIMIT 50"
 
@@ -318,14 +397,12 @@ class DBLayer:
         Search OpenSearch for dockets containing the given terms.
 
         Searches:
-        - documents index: title and comment fields
-        - comments index: commentText field (phrase matching)
-        - comments_extracted_text index: extractedText field (from PDF attachments)
+        - documents index: title and documentText fields
+        - comments index: commentText field
+        - comments_extracted_text index: extractedText field (counted as document-side evidence)
 
         Returns list of {docket_id, document_match_count, comment_match_count}.
-        comment_match_count is the number of distinct commentId values that match
-        (body and/or extracted text); multiple hits in one comment or multiple
-        extracted chunks for the same comment still count as one.
+        comment_match_count is distinct commentId matches from comments index only.
         """
         if opensearch_client is None:
             opensearch_client = get_opensearch_connection()
@@ -377,8 +454,7 @@ class DBLayer:
         Return per-docket totals for documents and comments.
 
         document_total_count: OpenSearch documents index rows per docket.
-        comment_total_count: distinct commentId values across comments and
-        comments_extracted_text (same universe as comment match numerators).
+        comment_total_count: distinct commentId values from comments index only.
         """
         if not docket_ids:
             return {}
@@ -407,16 +483,10 @@ class DBLayer:
 
             doc_response = opensearch_client.search(index="documents", body=doc_query)
 
-            try:
-                comment_response = opensearch_client.search(
-                    index="comments,comments_extracted_text",
-                    body=comment_body,
-                )
-            except Exception as e:  # pylint: disable=broad-exception-caught
-                print(f"OpenSearch comment totals multi-index failed, comments only: {e}")
-                comment_response = opensearch_client.search(
-                    index="comments", body=comment_body
-                )
+            comment_response = opensearch_client.search(
+                index="comments",
+                body=comment_body,
+            )
 
             totals: Dict[str, Dict[str, int]] = {}
 
@@ -456,34 +526,65 @@ class DBLayer:
                 return {"aggregations": {"by_docket": {"buckets": []}}}
 
         docket_counts: Dict = {}
-        doc_resp = safe_search("documents", self._build_docket_agg_query(
-            "matching_docs",
-            [{"multi_match": {"query": t, "fields": ["title", "comment"]}} for t in terms]
-        ))
+        doc_resp = safe_search(
+            "documents",
+            self._build_docket_agg_query(
+                "matching_docs",
+                [
+                    {
+                        "multi_match": {
+                            "query": t,
+                            "fields": ["title", "documentText"],
+                        }
+                    }
+                    for t in terms
+                ],
+            ),
+        )
         comment_resp = safe_search(
             "comments",
             self._build_docket_agg_query_unique_comments(
                 "matching_comments",
-                [{"match_phrase": {"commentText": t}} for t in terms],
+                [{"match": {"commentText": t}} for t in terms],
             ),
         )
         extracted_resp = safe_search(
             "comments_extracted_text",
             self._build_docket_agg_query_unique_comments(
                 "matching_extracted",
-                [{"match_phrase": {"extractedText": t}} for t in terms],
+                [{"match": {"extractedText": t}} for t in terms],
             ),
         )
         self._accumulate_counts(
             docket_counts, buckets(doc_resp), "matching_docs", "document_match_count"
         )
-        merged_comments = self._merge_unique_comment_matches(comment_resp, extracted_resp)
-        for did, cnt in merged_comments.items():
+        # comNum is strictly commentText matches from comments index.
+        comment_ids_by_docket = self._comment_ids_per_docket_from_agg(
+            comment_resp, "matching_comments"
+        )
+        for did, ids in comment_ids_by_docket.items():
             docket_counts.setdefault(
                 did, {"document_match_count": 0, "comment_match_count": 0}
             )
-            docket_counts[did]["comment_match_count"] = cnt
+            docket_counts[did]["comment_match_count"] = len(ids)
+
+        # Treat extracted attachment text as document-side evidence.
+        extracted_ids_by_docket = self._comment_ids_per_docket_from_agg(
+            extracted_resp, "matching_extracted"
+        )
+        for did, ids in extracted_ids_by_docket.items():
+            docket_counts.setdefault(
+                did, {"document_match_count": 0, "comment_match_count": 0}
+            )
+            docket_counts[did]["document_match_count"] += len(ids)
         return [{"docket_id": did, **counts} for did, counts in docket_counts.items()]
+
+    def get_agencies(self) -> List[str]:
+        if self.conn is None:
+            return []
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT agency_id FROM dockets ORDER BY agency_id")
+            return [row[0] for row in cur.fetchall()]
 
 
 def _get_secrets_from_aws() -> Dict[str, str]:
