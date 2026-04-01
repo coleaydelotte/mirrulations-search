@@ -2,7 +2,7 @@
 from datetime import date, datetime
 from typing import List
 
-from mirrsearch.db import cfr_part_filter_patterns, get_db
+from mirrsearch.db import cfr_part_filter_patterns, _cfr_exact_title_part_pairs, get_db
 
 
 def _correlation_score(row, support_k=10):
@@ -49,10 +49,30 @@ def _agency_matches_filter(row, agency):
     return any((a or "").strip().lower() in aid for a in agency)
 
 
+def _ref_has_exact_part(ref, title, part):
+    """True if ref matches the given title and part exactly."""
+    if str(ref.get("title") or "").strip() != title:
+        return False
+    return any(str(pk).strip() == part for pk in (ref.get("cfrParts") or {}).keys())
+
+
+def _cfr_exact_pairs_match_row(row, exact_pairs):
+    """True if any (title, part) pair matches any cfr_ref in the row."""
+    cfr_refs = row.get("cfr_refs") or []
+    return any(
+        _ref_has_exact_part(ref, title, part)
+        for title, part in exact_pairs
+        for ref in cfr_refs
+    )
+
+
 def _cfr_matches_filter(row, cfr_part_param):
     """Postgres: OR of cp.cfrPart ILIKE when CFR filter set."""
     if not cfr_part_param:
         return True
+    exact_pairs = _cfr_exact_title_part_pairs(cfr_part_param)
+    if exact_pairs:
+        return _cfr_exact_pairs_match_row(row, exact_pairs)
     patterns = cfr_part_filter_patterns(cfr_part_param)
     return not patterns or _cfr_part_patterns_match_row(row, patterns)
 
@@ -80,6 +100,16 @@ def _row_matches_advanced_filters(row, docket_type_param, agency, cfr_part_param
         and _agency_matches_filter(row, agency)
         and _cfr_matches_filter(row, cfr_part_param)
     )
+
+def _transform_cfr_refs(result):
+    """Convert raw cfr_refs into the cfrPart list format for API responses."""
+    cfr_refs = result.pop("cfr_refs", None)
+    if cfr_refs is not None:
+        result["cfrPart"] = [
+            {"title": ref.get("title"), "part": part, "link": link}
+            for ref in cfr_refs
+            for part, link in ref.get("cfrParts", {}).items()
+        ]
 
 
 class InternalLogic:  # pylint: disable=too-few-public-methods
@@ -190,13 +220,7 @@ class InternalLogic:  # pylint: disable=too-few-public-methods
         page_results = all_results[start_idx:end_idx]
         for result in page_results:
             _sanitize_search_row_for_json(result)
-            cfr_refs = result.pop("cfr_refs", None)
-            if cfr_refs is not None:
-                result["cfrPart"] = [
-                    {"title": ref.get("title"), "part": part, "link": link}
-                    for ref in cfr_refs
-                    for part, link in ref.get("cfrParts", {}).items()
-                ]
+            _transform_cfr_refs(result)
 
         # Rename internal keys to user-facing numerator/denominator names
         key_map = {
